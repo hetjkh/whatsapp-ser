@@ -98,8 +98,9 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson<SendBody>(req);
       const phone = String(body.phone || "").trim();
       const text = String(body.text || "").trim();
-      if (!phone || !text) {
-        json(res, 400, { error: "phone and text are required." });
+      const hasMedia = Boolean(body.media?.contentBase64);
+      if (!phone || (!text && !hasMedia)) {
+        json(res, 400, { error: "phone and text (or media) are required." });
         return;
       }
 
@@ -112,7 +113,7 @@ const server = http.createServer(async (req, res) => {
         };
       }
 
-      await sendWhatsAppBrief(phone, text, media);
+      await sendWhatsAppBrief(phone, text || `Attachment: ${media?.filename || "file"}`, media);
       json(res, 200, { ok: true });
       return;
     }

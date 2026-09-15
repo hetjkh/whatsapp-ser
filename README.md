@@ -50,6 +50,25 @@ pm2 startup
 
 Put nginx (or Caddy) in front with HTTPS on a subdomain, e.g. `wa.yourdomain.com` → `127.0.0.1:8787`.
 
+**Important:** raise the body size limit or image uploads return **413**:
+
+```nginx
+server {
+  server_name wa.theunboxing.ae;
+  client_max_body_size 25m;
+
+  location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_read_timeout 120s;
+  }
+}
+```
+
+Then `sudo nginx -t && sudo systemctl reload nginx`.
+
 ## Website env
 
 On the Next.js site (Vercel / host):
