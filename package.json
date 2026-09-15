@@ -1,0 +1,29 @@
+{
+  "name": "theunboxing-whatsapp-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Always-on Baileys WhatsApp service for The Unboxing (run on VPS)",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "start": "tsx --env-file=.env src/index.ts",
+    "start:prod": "node --import tsx src/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "jimp": "^1.6.1",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.34.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/qrcode": "^1.5.6",
+    "tsx": "^4.23.12",
+    "typescript": "^5"
+  }
+}
