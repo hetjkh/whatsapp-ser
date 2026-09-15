@@ -1,5 +1,6 @@
 import http from "http";
 import {
+  getAuthDir,
   getWhatsAppSnapshot,
   logoutWhatsAppSession,
   sendWhatsAppBrief,
@@ -65,7 +66,12 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "GET" && url.pathname === "/health") {
       const snapshot = getWhatsAppSnapshot();
-      json(res, 200, { ok: true, status: snapshot.status, updatedAt: snapshot.updatedAt });
+      json(res, 200, {
+        ok: true,
+        status: snapshot.status,
+        updatedAt: snapshot.updatedAt,
+        authDir: getAuthDir(),
+      });
       return;
     }
 
@@ -121,10 +127,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[whatsapp-service] listening on http://${HOST}:${PORT}`);
+  console.log(`[whatsapp-service] auth dir: ${getAuthDir()}`);
   if (!SECRET) {
     console.warn("[whatsapp-service] WARNING: WHATSAPP_SERVICE_SECRET is empty");
   }
-  // Auto-resume session if auth files already exist
   void startWhatsAppSession().catch((error) => {
     console.warn(
       "[whatsapp-service] auto-start:",

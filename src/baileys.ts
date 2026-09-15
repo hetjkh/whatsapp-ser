@@ -1,5 +1,6 @@
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 import qrcode from "qrcode";
 import pino from "pino";
 import sharp from "sharp";
@@ -35,7 +36,10 @@ type SessionState = WhatsAppSessionSnapshot & {
   starting: Promise<void> | null;
 };
 
-const AUTH_DIR = path.join(process.cwd(), "data", "baileys_auth");
+// Stable path next to the package (not process.cwd) so pm2 restarts keep the session
+const SERVICE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+const AUTH_DIR =
+  (process.env.AUTH_DIR || "").trim() || path.join(SERVICE_ROOT, "data", "baileys_auth");
 
 let state: SessionState = {
   status: "idle",
@@ -47,8 +51,18 @@ let state: SessionState = {
   starting: null,
 };
 
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
 function touch(patch: Partial<SessionState>) {
   Object.assign(state, patch, { updatedAt: new Date().toISOString() });
+}
+
+function hasAuthFiles(): boolean {
+  try {
+    return fs.existsSync(path.join(AUTH_DIR, "creds.json"));
+  } catch {
+    return false;
+  }
 }
 
 export function getWhatsAppSnapshot(): WhatsAppSessionSnapshot {
@@ -59,6 +73,10 @@ export function getWhatsAppSnapshot(): WhatsAppSessionSnapshot {
     lastError: state.lastError,
     updatedAt: state.updatedAt,
   };
+}
+
+export function getAuthDir(): string {
+  return AUTH_DIR;
 }
 
 function toJid(phone: string): string {
@@ -86,6 +104,19 @@ function isConnectionClosedError(error: unknown): boolean {
   return /connection closed|timed out|socket closed|statusCode":428|1006/i.test(message);
 }
 
+function scheduleReconnect(delayMs = 2500) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void startWhatsAppSession(true).catch((error) => {
+      touch({
+        status: "disconnected",
+        lastError: error instanceof Error ? error.message : "Reconnect failed.",
+      });
+    });
+  }, delayMs);
+}
+
 async function waitForConnectionOpen(socket: WASocket, timeoutMs = 45_000): Promise<void> {
   if (state.status === "connected" && isSocketOpen(socket)) return;
   if (state.status === "qr") return;
@@ -93,7 +124,7 @@ async function waitForConnectionOpen(socket: WASocket, timeoutMs = 45_000): Prom
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       cleanup();
-      if (state.status === "qr") {
+      if (state.status === "qr" || state.status === "connected") {
         resolve();
         return;
       }
@@ -113,7 +144,8 @@ async function waitForConnectionOpen(socket: WASocket, timeoutMs = 45_000): Prom
       }
       if (update.connection === "close") {
         cleanup();
-        reject(new Error("WhatsApp connection closed while connecting."));
+        // Pairing often closes with restartRequired — reconnect handles it
+        resolve();
       }
     };
 
@@ -139,6 +171,8 @@ async function createSocket() {
   const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  console.log(`[whatsapp] auth dir: ${AUTH_DIR} (creds=${hasAuthFiles()})`);
+
   const socket = makeWASocket({
     version,
     auth: authState,
@@ -151,23 +185,32 @@ async function createSocket() {
     retryRequestDelayMs: 500,
   });
 
-  socket.ev.on("creds.update", saveCreds);
+  socket.ev.on("creds.update", async () => {
+    try {
+      await saveCreds();
+    } catch (error) {
+      console.error("[whatsapp] failed to save creds", error);
+    }
+  });
 
   socket.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      const qrDataUrl = await qrcode.toDataURL(qr, {
-        margin: 1,
-        width: 320,
-        errorCorrectionLevel: "M",
-      });
-      touch({
-        status: "qr",
-        qrDataUrl,
-        connectedJid: null,
-        lastError: null,
-      });
+      // Avoid flashing a new QR when we already have saved credentials (reconnect)
+      if (!hasAuthFiles()) {
+        const qrDataUrl = await qrcode.toDataURL(qr, {
+          margin: 1,
+          width: 320,
+          errorCorrectionLevel: "M",
+        });
+        touch({
+          status: "qr",
+          qrDataUrl,
+          connectedJid: null,
+          lastError: null,
+        });
+      }
     }
 
     if (connection === "open") {
@@ -178,31 +221,36 @@ async function createSocket() {
         lastError: null,
         socket,
       });
+      console.log(`[whatsapp] connected as ${socket.user?.id ?? "unknown"}`);
     }
 
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      // After QR pair, WhatsApp often sends 515 restartRequired — must reconnect with same auth
+      const restartRequired =
+        statusCode === DisconnectReason.restartRequired || statusCode === 515;
+
       touch({
         status: loggedOut ? "logged_out" : "disconnected",
         qrDataUrl: null,
         connectedJid: null,
         lastError: loggedOut
           ? "WhatsApp session logged out. Scan a new QR code."
-          : lastDisconnect?.error?.message || "WhatsApp disconnected.",
+          : restartRequired
+            ? "Pairing complete — reconnecting…"
+            : lastDisconnect?.error?.message || "WhatsApp disconnected.",
         socket: null,
       });
 
-      if (!loggedOut) {
-        setTimeout(() => {
-          void startWhatsAppSession().catch((error) => {
-            touch({
-              status: "disconnected",
-              lastError: error instanceof Error ? error.message : "Reconnect failed.",
-            });
-          });
-        }, 2500);
+      if (loggedOut) {
+        if (fs.existsSync(AUTH_DIR)) {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        }
+        return;
       }
+
+      scheduleReconnect(restartRequired ? 1000 : 2500);
     }
   });
 
@@ -219,7 +267,15 @@ function endSocketQuietly(socket: WASocket | null) {
 }
 
 export async function startWhatsAppSession(force = false): Promise<WhatsAppSessionSnapshot> {
+  // Keep live sessions — page refresh / accidental Connect must not wipe them
   if (!force && state.status === "connected" && isSocketOpen(state.socket)) {
+    return getWhatsAppSnapshot();
+  }
+  if (!force && state.status === "qr" && state.socket) {
+    return getWhatsAppSnapshot();
+  }
+  if (!force && state.starting) {
+    await state.starting;
     return getWhatsAppSnapshot();
   }
 
@@ -234,7 +290,7 @@ export async function startWhatsAppSession(force = false): Promise<WhatsAppSessi
     touch({
       status: "connecting",
       lastError: null,
-      qrDataUrl: null,
+      qrDataUrl: force ? null : state.qrDataUrl,
     });
 
     try {
@@ -245,7 +301,7 @@ export async function startWhatsAppSession(force = false): Promise<WhatsAppSessi
       touch({ socket });
       await waitForConnectionOpen(socket);
     } catch (error) {
-      if (state.status !== "qr") {
+      if (state.status !== "qr" && state.status !== "connected") {
         touch({
           status: "disconnected",
           lastError: error instanceof Error ? error.message : "Failed to start WhatsApp.",
@@ -263,6 +319,11 @@ export async function startWhatsAppSession(force = false): Promise<WhatsAppSessi
 }
 
 export async function logoutWhatsAppSession(): Promise<WhatsAppSessionSnapshot> {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   try {
     if (state.socket) {
       await state.socket.logout();
@@ -303,7 +364,7 @@ function isImageMime(mime: string | undefined, filename: string): boolean {
 
 async function ensureConnectedSocket(forceReconnect = false): Promise<WASocket> {
   if (forceReconnect || state.status !== "connected" || !isSocketOpen(state.socket)) {
-    await startWhatsAppSession(forceReconnect || state.status === "connected");
+    await startWhatsAppSession(true);
   }
 
   for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -327,7 +388,7 @@ async function writeTempMedia(media: WhatsAppMediaAttachment): Promise<{
   jpegThumbnail?: string;
 }> {
   const asImage = isImageMime(media.contentType, media.filename);
-  const tmpRoot = path.join(process.cwd(), "data", "tmp");
+  const tmpRoot = path.join(SERVICE_ROOT, "data", "tmp");
   fs.mkdirSync(tmpRoot, { recursive: true });
 
   if (asImage) {
